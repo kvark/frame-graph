@@ -1,0 +1,7 @@
+[package]
+name = "frame_graph"
+version = "0.1.0"
+authors = ["Dzmitry Malyshau <kvark@mozilla.com>"]
+
+[dependencies]
+gfx_core = { git = "https://github.com/gfx-rs/gfx", branch = "ll" }
