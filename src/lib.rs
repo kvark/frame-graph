@@ -1,12 +1,12 @@
 extern crate gfx_hal as hal;
 
-
 struct Epoch(u16);
 
-pub struct Attachments {
-    pub inputs: Vec<(ImageRef, hal::image::SubresourceLayers, hal::image::ImageLayout)>,
-    pub outputs: Vec<(ImageRef, hal::image::SubresourceLayers, hal::image::ImageLayout, hal::pass::AttachmentOps)>,
-    pub depth_stencil: Option<(ImageRef, hal::image::SubresourceLayers, hal::image::ImageLayout, hal::pass::AttachmentOps, hal::pass::AttachmentOps)>,
+// TODO: split the public attachments to use slices, versus internal attachments to use vectors.
+pub struct Attachments<S> {
+    pub inputs: Vec<(ImageRef, S)>,
+    pub outputs: Vec<(ImageRef, S, hal::pass::AttachmentOps)>,
+    pub depth_stencil: Option<(ImageRef, S, hal::pass::AttachmentOps, hal::pass::AttachmentOps)>,
 }
 
 pub struct Resources {
@@ -30,12 +30,6 @@ pub trait WorkTask<B: hal::Backend, C> {
     fn record<'a>(&self, &mut hal::command::CommandBuffer<'a, B, C>);
 }
 
-enum Task<B: hal::Backend> {
-    Graphics(Vec<(Box<RenderTask<B>>, Attachments, Resources)>),
-    Transfer(Box<WorkTask<B, hal::Transfer>>),
-    Compute(Box<WorkTask<B, hal::Compute>>),
-}
-
 
 pub struct Buffer<'a, B: hal::Backend> {
     pub size: u64,
@@ -44,12 +38,19 @@ pub struct Buffer<'a, B: hal::Backend> {
 }
 
 trait Resource {
+    type Part: Clone;
     type State;
+    fn full_part(&self) -> Self::Part;
     fn idle_state(&self) -> Self::State;
 }
 
 impl<'a, B: hal::Backend> Resource for Buffer<'a, B> {
+    type Part = ();
     type State = hal::buffer::State;
+
+    fn full_part(&self) -> Self::Part {
+        ()
+    }
     fn idle_state(&self) -> Self::State {
         match self.body {
             Some((_, state)) => state,
@@ -65,7 +66,16 @@ pub struct Image<'a, B: hal::Backend> {
 }
 
 impl<'a, B: hal::Backend> Resource for Image<'a, B> {
+    type Part = hal::image::SubresourceRange;
     type State = hal::image::State;
+
+    fn full_part(&self) -> Self::Part {
+        hal::image::SubresourceRange {
+            aspects: self.format.aspects(),
+            levels: 0 .. self.kind.get_num_levels(),
+            layers: 0 .. self.kind.get_num_layers(),
+        }
+    }
     fn idle_state(&self) -> Self::State {
         match self.body {
             Some((_, state)) => state,
@@ -75,14 +85,19 @@ impl<'a, B: hal::Backend> Resource for Image<'a, B> {
 }
 
 
-struct TrackedState<S> {
-    state: S,
-    previous_epoch: Epoch,
+struct TrackedState<R: Resource> {
+    part: R::Part,
+    state: R::State,
+    /// The list of dependent epoch for this state,
+    /// each with the respective sub-resource.
+    /// Those parts have to be disjoint,
+    /// and their union has to be a subset of `self.part`.
+    dependencies: Vec<(Epoch, R::Part)>,
 }
 
 struct TrackedResource<R: Resource> {
     resource: R,
-    states: Vec<TrackedState<R::State>>,
+    states: Vec<TrackedState<R>>,
 }
 
 impl<R: Resource> From<R> for TrackedResource<R> {
@@ -90,8 +105,9 @@ impl<R: Resource> From<R> for TrackedResource<R> {
         TrackedResource {
             states: vec![
                 TrackedState {
+                    part: resource.full_part(),
                     state: resource.idle_state(),
-                    previous_epoch: Epoch(0),
+                    dependencies: Vec::new(),
                 },
             ],
             resource,
@@ -99,9 +115,39 @@ impl<R: Resource> From<R> for TrackedResource<R> {
     }
 }
 
+enum Task<B: hal::Backend> {
+    Graphics(Box<RenderTask<B>>, Attachments<Epoch>, Resources),
+    Transfer(Box<WorkTask<B, hal::Transfer>>),
+    Compute(Box<WorkTask<B, hal::Compute>>),
+}
+
 pub struct BufferRef(usize);
 pub struct ImageRef(usize);
 
+
+/*
+impl SubresourceRange {
+    /// Return true if the range contains no subresources.
+    pub fn is_empty(&self) -> bool {
+        self.aspects.is_empty() ||
+        self.levels.start >= self.levels.end ||
+        self.layers.start >= self.layers.end
+    }
+}
+
+
+fn intersect_image_parts(impl BitAnd for SubresourceRange {
+    type Output = Self;
+    fn bitand(self, sl: SubresourceRange) -> Self {
+        SubresourceRange {
+            aspects: self.aspects & sl.aspects,
+            //TODO: ensure the result ranges are at least valid
+            levels: self.levels.start.max(sl.levels.start) .. self.levels.end.min(sl.levels.end),
+            layers: self.layers.start.max(sl.layers.start) .. self.layers.end.min(sl.layers.end),
+        }
+    }
+}
+*/
 
 pub struct FrameGraph<'a, B: hal::Backend> {
     buffers: Vec<TrackedResource<Buffer<'a, B>>>,
@@ -132,20 +178,76 @@ impl<'a, B: hal::Backend> FrameGraph<'a, B> {
         ImageRef(id)
     }
 
-    pub fn add_render_task<T: RenderTask<B>>(
+    fn stamp_image(
         &mut self,
-        task: T,
-        attachments: Attachments,
-        resources: Resources,
-    ) {
-        let pass = (Box::new(task) as Box<_>, attachments, resources);
-        self.tasks.push(Task::Graphics(vec![pass]));
+        image_ref: &ImageRef,
+        subresource: hal::image::SubresourceRange,
+        access: hal::image::Access,
+        layout: hal::image::ImageLayout,
+    ) -> Epoch {
         // for each resource
         //   if it's being written to, or the last use was writing to
         //     create a new resource epoch
         //     wrap up the previous one, make a transition
         //  if it's read and the last one was reading
         //     add the access flags to the current epoch
+        let tr = &mut self.images[image_ref.0];
+        // On the way down, we may end up with disjoint sub-sets of the original
+        // sub-resource that we'll need to track independently.
+        let mut active_parts = vec![subresource];
+        for (i, ts) in tr.states.iter_mut().enumerate().rev() {
+            let mut j = 0;
+            while j < active_parts.len() {
+                let part = &mut active_parts[j];
+                let intersection = hal::image::SubresourceRange {
+                    aspects: ts.part.aspects & part.aspects,
+                    levels: ts.part.levels.start.max(part.levels.start) .. ts.part.levels.end.min(part.levels.end),
+                    layers: ts.part.layers.start.max(part.layers.start) .. ts.part.layers.end.min(part.layers.end),
+                };
+                if intersection.aspects.is_empty() ||
+                    intersection.levels.start >= intersection.levels.end ||
+                    intersection.layers.start >= intersection.layers.end
+                {
+                    // this state doesn't affect our case
+                    j += 1;
+                    continue
+                }
+                if access.intersects(&hal::image::Access::ALL_WRITE) ||
+                    ts.state.0.intersects(&hal::image::Access::ALL_WRITE)
+                {
+                    // dependency is required
+                }
+            }
+        }
+        panic!("Sub-parts {:?} are not covered by full range {:?}", active_parts, tr.resource.full_part());
+    }
+
+    pub fn add_render_task<T: RenderTask<B>>(
+        &mut self,
+        task: T,
+        attachments: Attachments<(hal::image::SubresourceLayers, hal::image::ImageLayout)>,
+        resources: Resources,
+    ) {
+        let mut atts = Attachments {
+            inputs: Vec::with_capacity(attachments.inputs.len()),
+            outputs: Vec::with_capacity(attachments.outputs.len()),
+            depth_stencil: None,
+        };
+        for (ir, (sl, layout)) in attachments.inputs {
+            let epoch = self.stamp_image(&ir, sl.into(), hal::image::Access::INPUT_ATTACHMENT_READ, layout);
+            atts.inputs.push((ir, epoch));
+        }
+        for (ir, (sl, layout), ops) in attachments.outputs {
+            let epoch = self.stamp_image(&ir, sl.into(), hal::image::Access::COLOR_ATTACHMENT_WRITE, layout);
+            //TODO: transition from `Undefined` if the contents are not relevant according to the `ops`
+            atts.outputs.push((ir, epoch, ops));
+        }
+        if let Some((ir, (sl, layout), depth_ops, stencil_ops)) = attachments.depth_stencil {
+            let epoch = self.stamp_image(&ir, sl.into(), hal::image::Access::DEPTH_STENCIL_ATTACHMENT_WRITE, layout);
+            atts.depth_stencil = Some((ir, epoch, depth_ops, stencil_ops));
+        }
+        //TODO: resources, etc
+        self.tasks.push(Task::Graphics(Box::new(task) as Box<_>, atts, resources));
     }
 
     pub fn run(&mut self, device: &mut B::Device) {
@@ -154,7 +256,7 @@ impl<'a, B: hal::Backend> FrameGraph<'a, B> {
         let mut nodes = Vec::new();
         for task in &mut self.tasks {
             nodes.push(match *task {
-                Task::Graphics(ref mut task_passes) => {
+                Task::Graphics(ref mut t, _, _) => {
                     //TODO: combine multiple passes into fewer nodes
                     let attachments = vec![];
                     let subpasses = vec![];
@@ -165,18 +267,11 @@ impl<'a, B: hal::Backend> FrameGraph<'a, B> {
                         height: 0,
                         depth: 0,
                     };
-                    let subpasses = task_passes
-                        .iter_mut()
-                        .enumerate()
-                        .map(|(i, t)| {
-                            t.0.prepare(device, hal::pass::Subpass {
-                                main_pass: &renderpass,
-                                index: i as _,
-                            });
-                            t.0.as_ref()
-                        })
-                        .collect();
-                    Node::Graphics(subpasses, renderpass, extent, Vec::new())
+                    t.prepare(device, hal::pass::Subpass {
+                        main_pass: &renderpass,
+                        index: 0, //TODO
+                    });
+                    Node::Graphics(vec![t.as_mut()], renderpass, extent, Vec::new())
                 }
                 Task::Transfer(ref t) => {
                     Node::Transfer(t.as_ref())
